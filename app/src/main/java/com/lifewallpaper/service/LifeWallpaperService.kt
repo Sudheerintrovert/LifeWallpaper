@@ -11,6 +11,8 @@ import android.os.Handler
 import android.os.Looper
 import android.service.wallpaper.WallpaperService
 import android.view.SurfaceHolder
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.*
 import kotlin.math.max
 import kotlin.math.min
@@ -18,6 +20,25 @@ import kotlin.math.min
 class LifeWallpaperService : WallpaperService() {
 
     override fun onCreateEngine(): Engine = LifeEngine()
+
+    data class Goal(val text: String, val goalDate: String, val reached: Boolean)
+
+    private fun parseGoals(json: String): List<Goal> {
+        if (json.isEmpty()) return emptyList()
+        try {
+            val arr = JSONArray(json)
+            val list = mutableListOf<Goal>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                list.add(Goal(
+                    text = obj.optString("text", ""),
+                    goalDate = obj.optString("goalDate", ""),
+                    reached = obj.optBoolean("reached", false)
+                ))
+            }
+            return list
+        } catch (e: Exception) { return emptyList() }
+    }
 
     inner class LifeEngine : Engine(), SharedPreferences.OnSharedPreferenceChangeListener {
 
@@ -33,6 +54,24 @@ class LifeWallpaperService : WallpaperService() {
             super.onCreate(holder)
             prefs = getSharedPreferences("life_wallpaper", MODE_PRIVATE)
             prefs.registerOnSharedPreferenceChangeListener(this)
+            migrateOldData()
+        }
+
+        private fun migrateOldData() {
+            val existing = prefs.getString("goals_json", "")
+            if (existing.isNullOrEmpty()) {
+                val oldGoalText = prefs.getString("goal_text", "") ?: ""
+                val oldGoalDate = prefs.getString("goal_date", "") ?: ""
+                if (oldGoalText.isNotEmpty() && oldGoalDate.isNotEmpty()) {
+                    val arr = JSONArray()
+                    val obj = JSONObject()
+                    obj.put("text", oldGoalText)
+                    obj.put("goalDate", oldGoalDate)
+                    obj.put("reached", false)
+                    arr.put(obj)
+                    prefs.edit().putString("goals_json", arr.toString()).apply()
+                }
+            }
         }
 
         override fun onDestroy() {
@@ -102,22 +141,18 @@ class LifeWallpaperService : WallpaperService() {
                 val w = canvas.width
                 val ht = canvas.height
 
-                // Read settings
                 val isDark = prefs.getBoolean("dark_theme", true)
                 val textHex = prefs.getString("text_color", "#ffffff") ?: "#ffffff"
                 val birthDateStr = prefs.getString("birth_date", "") ?: ""
-                val goalDateStr = prefs.getString("goal_date", "") ?: ""
-                val goalText = prefs.getString("goal_text", "") ?: ""
+                val goalsJson = prefs.getString("goals_json", "") ?: ""
                 val fontSize = prefs.getInt("font_size", 48)
-                val fontFamily = prefs.getInt("font_family", 0) // 0=sans, 1=serif, 2=mono
+                val fontFamily = prefs.getInt("font_family", 0)
                 val breathing = prefs.getBoolean("breathing", true)
-                val dividerStyle = prefs.getInt("divider_style", 0) // 0=thin, 1=dashed, 2=gradient
+                val dividerStyle = prefs.getInt("divider_style", 0)
 
-                // Background
                 canvas.drawColor(if (isDark) Color.BLACK else Color.WHITE)
 
-                if (birthDateStr.isEmpty() || goalDateStr.isEmpty()) {
-                    // Draw setup message
+                if (birthDateStr.isEmpty()) {
                     val msgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                         color = Color.parseColor(if (isDark) "#333333" else "#cccccc")
                         textSize = 40f
@@ -129,22 +164,22 @@ class LifeWallpaperService : WallpaperService() {
                     return
                 }
 
-                // Parse dates
                 val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.US)
                 val birthDate = sdf.parse(birthDateStr) ?: Date(0)
-                val goalDate = sdf.parse(goalDateStr) ?: Date(0)
                 val now = Date()
-
                 val elapsed = calcDiff(birthDate, now)
-                val isGoalPast = goalDate.before(now)
-                val remaining = if (isGoalPast) Triple(0, 0, 0) else calcDiff(now, goalDate)
 
-                // Calculate sizes
-                val baseSize = fontSize.toFloat() * 3 // scale for px
+                val goals = parseGoals(goalsJson)
+                val activeGoal = goals.firstOrNull { !it.reached }
+                val reachedCount = goals.count { it.reached }
+                val totalGoals = goals.size
+                val allReached = activeGoal == null && totalGoals > 0
+
+                val baseSize = fontSize.toFloat() * 3
                 val labelSize = baseSize * 0.35f
                 val goalSize = baseSize * 0.55f
                 val dateSize = baseSize * 0.3f
-                val achievedSize = baseSize * 0.5f
+                val smallSize = baseSize * 0.25f
 
                 val textColor = try { Color.parseColor(textHex) } catch (_: Exception) { Color.parseColor("#ffffff") }
                 val dimColor = Color.argb(
@@ -161,24 +196,30 @@ class LifeWallpaperService : WallpaperService() {
                 )
 
                 val cx = w / 2f
-                var y = ht / 2f
 
-                // ── Layout Calculation (center vertically) ──
                 val lineH = baseSize * 1.3f
                 val gap = baseSize * 1.5f
                 val dividerH = baseSize * 0.6f
 
-                val goalLines = wrapText(goalText, goalSize, w * 0.7f)
-                val goalBlockH = goalLines.size * goalSize * 1.4f
+                var totalContentH: Float
+                if (allReached) {
+                    totalContentH = (lineH * 3) + gap + dividerH + gap + goalSize * 2 + gap + dividerH
+                } else if (activeGoal != null) {
+                    val goalLines = wrapText(activeGoal.text, goalSize, w * 0.7f)
+                    val goalBlockH = goalLines.size * goalSize * 1.4f
+                    totalContentH = (lineH * 3) + gap + dividerH + gap + goalBlockH + gap + dividerH + gap + dateSize + gap + (lineH * 3)
+                    if (totalGoals > 1) totalContentH += smallSize + gap * 0.5f
+                } else {
+                    totalContentH = (lineH * 3) + gap + dividerH + gap + goalSize * 1.5f + gap + dividerH
+                }
 
-                val totalH = (lineH * 3) + gap + dividerH + gap + goalBlockH + gap + dividerH + gap + dateSize + gap + (lineH * 3)
-                var startY = (ht - totalH) / 2f + baseSize * 0.4f
+                var y = (ht - totalContentH) / 2f + baseSize * 0.4f
+                if (y < baseSize) y = baseSize
 
                 canvas.save()
                 canvas.globalAlpha = fadeAlpha / 255f
 
-                // ── Elapsed Time ──
-                y = startY
+                // Elapsed Time
                 drawTimeValue(canvas, elapsed.first, "Y", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
                 y += lineH
                 drawTimeValue(canvas, elapsed.second, "M", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
@@ -187,76 +228,126 @@ class LifeWallpaperService : WallpaperService() {
 
                 y += gap
 
-                // ── Divider 1 ──
+                // Divider 1
                 y += dividerH / 2
                 drawDivider(canvas, cx, y, w * 0.45f, dividerColor, dividerStyle)
                 y += dividerH / 2
 
                 y += gap
 
-                // ── Goal Text ──
-                val goalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = textColor
-                    textSize = goalSize
-                    textAlign = Paint.Align.CENTER
-                    typeface = getTypeface(fontFamily)
-                    letterSpacing = 0.05f
-                }
-                if (breathing) {
-                    breathingPhase = ((System.currentTimeMillis() % 4000) / 4000f) * 2f * Math.PI.toFloat()
-                    val alpha = 0.7f + 0.3f * ((1f + kotlin.math.sin(breathingPhase)) / 2f)
-                    goalPaint.alpha = (alpha * 255f).toInt()
-                }
-                for (line in goalLines) {
-                    y += goalSize * 1.2f
-                    canvas.drawText(line, cx, y, goalPaint)
-                }
-                y += goalSize * 0.5f
+                if (allReached) {
+                    // ALL GOALS ACHIEVED
+                    val congratsPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = textColor
+                        textSize = goalSize
+                        textAlign = Paint.Align.CENTER
+                        typeface = getTypeface(fontFamily)
+                        letterSpacing = 0.05f
+                    }
+                    y += goalSize
+                    canvas.drawText("All Goals Achieved!", cx, y, congratsPaint)
+                    y += goalSize * 0.6f
 
-                y += gap
-
-                // ── Divider 2 ──
-                y += dividerH / 2
-                drawDivider(canvas, cx, y, w * 0.45f, dividerColor, dividerStyle)
-                y += dividerH / 2
-
-                y += gap
-
-                // ── Target Date ──
-                val dateStr = formatDate(goalDate)
-                val datePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = faintColor
-                    textSize = dateSize
-                    textAlign = Paint.Align.CENTER
-                    typeface = getTypeface(fontFamily)
-                    letterSpacing = 0.15f
-                }
-                y += dateSize
-                canvas.drawText(dateStr, cx, y, datePaint)
-
-                y += gap
-
-                // ── Countdown ──
-                if (isGoalPast) {
-                    val achPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    val countPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                         color = dimColor
-                        textSize = achievedSize
+                        textSize = smallSize
                         textAlign = Paint.Align.CENTER
                         typeface = getTypeface(fontFamily)
                     }
-                    y += achievedSize
-                    canvas.drawText("Goal Achieved", cx, y, achPaint)
+                    y += smallSize
+                    canvas.drawText("$reachedCount goals completed", cx, y, countPaint)
+                } else if (activeGoal != null) {
+                    // Goal Text with breathing
+                    val goalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = textColor
+                        textSize = goalSize
+                        textAlign = Paint.Align.CENTER
+                        typeface = getTypeface(fontFamily)
+                        letterSpacing = 0.05f
+                    }
+                    if (breathing) {
+                        breathingPhase = ((System.currentTimeMillis() % 4000) / 4000f) * 2f * Math.PI.toFloat()
+                        val alpha = 0.7f + 0.3f * ((1f + kotlin.math.sin(breathingPhase)) / 2f)
+                        goalPaint.alpha = (alpha * 255f).toInt()
+                    }
+                    val goalLines = wrapText(activeGoal.text, goalSize, w * 0.7f)
+                    for (line in goalLines) {
+                        y += goalSize * 1.2f
+                        canvas.drawText(line, cx, y, goalPaint)
+                    }
+                    y += goalSize * 0.5f
+
+                    // Goal counter if multiple goals
+                    if (totalGoals > 1) {
+                        val counterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = faintColor
+                            textSize = smallSize
+                            textAlign = Paint.Align.CENTER
+                            typeface = getTypeface(fontFamily)
+                        }
+                        y += smallSize
+                        val activeNum = goals.indexOf(activeGoal) + 1
+                        canvas.drawText("Goal $activeNum of $totalGoals  |  $reachedCount reached", cx, y, counterPaint)
+                        y += gap * 0.5f
+                    }
+
+                    y += gap
+
+                    // Divider 2
+                    y += dividerH / 2
+                    drawDivider(canvas, cx, y, w * 0.45f, dividerColor, dividerStyle)
+                    y += dividerH / 2
+
+                    y += gap
+
+                    // Target Date
+                    val goalDate = sdf.parse(activeGoal.goalDate) ?: Date(0)
+                    val isGoalPast = goalDate.before(now)
+                    val dateStr = formatDate(goalDate)
+                    val datePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = faintColor
+                        textSize = dateSize
+                        textAlign = Paint.Align.CENTER
+                        typeface = getTypeface(fontFamily)
+                        letterSpacing = 0.15f
+                    }
+                    y += dateSize
+                    canvas.drawText(dateStr, cx, y, datePaint)
+
+                    y += gap
+
+                    // Countdown
+                    if (isGoalPast) {
+                        val reachedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = dimColor
+                            textSize = goalSize * 0.8f
+                            textAlign = Paint.Align.CENTER
+                            typeface = getTypeface(fontFamily)
+                        }
+                        y += goalSize * 0.8f
+                        canvas.drawText("Deadline Passed!", cx, y, reachedPaint)
+                    } else {
+                        val remaining = calcDiff(now, goalDate)
+                        drawTimeValue(canvas, remaining.first, "Y", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
+                        y += lineH
+                        drawTimeValue(canvas, remaining.second, "M", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
+                        y += lineH
+                        drawTimeValue(canvas, remaining.third, "D", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
+                    }
                 } else {
-                    drawTimeValue(canvas, remaining.first, "Y", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
-                    y += lineH
-                    drawTimeValue(canvas, remaining.second, "M", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
-                    y += lineH
-                    drawTimeValue(canvas, remaining.third, "D", cx, y, baseSize, labelSize, textColor, dimColor, fontFamily)
+                    // No goals set
+                    val noGoalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = dimColor
+                        textSize = goalSize
+                        textAlign = Paint.Align.CENTER
+                        typeface = getTypeface(fontFamily)
+                    }
+                    y += goalSize
+                    canvas.drawText("Open Settings to Add a Goal", cx, y, noGoalPaint)
                 }
 
                 canvas.restore()
 
-                // Breathing redraw
                 if (breathing && isVisible) {
                     handler.removeCallbacksAndMessages(null)
                     handler.postDelayed({ draw() }, 100)
@@ -289,7 +380,6 @@ class LifeWallpaperService : WallpaperService() {
             val numText = value.toString()
             val numWidth = numPaint.measureText(numText)
             canvas.drawText(numText, cx - labelSize * 0.8f, y, numPaint)
-            labelPaint.textAlign = Paint.Align.LEFT
             canvas.drawText(label, cx - labelSize * 0.8f + numWidth / 2f + labelSize * 0.3f, y, labelPaint)
         }
 
@@ -297,18 +387,18 @@ class LifeWallpaperService : WallpaperService() {
             val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 this.color = color
                 strokeWidth = 1f
-                style = if (style == 1) Paint.Style.STROKE else Paint.Style.STROKE
+                this.style = Paint.Style.STROKE
             }
             when (style) {
-                0 -> { // thin solid
+                0 -> {
                     paint.pathEffect = null
                     canvas.drawLine(cx - width / 2, y, cx + width / 2, y, paint)
                 }
-                1 -> { // dashed
+                1 -> {
                     paint.pathEffect = DashPathEffect(floatArrayOf(12f, 8f), 0f)
                     canvas.drawLine(cx - width / 2, y, cx + width / 2, y, paint)
                 }
-                2 -> { // gradient
+                2 -> {
                     paint.pathEffect = null
                     val gradColor1 = Color.argb(0, Color.red(color), Color.green(color), Color.blue(color))
                     val grad = LinearGradient(cx - width / 2, 0f, cx + width / 2, 0f, gradColor1, color, Shader.TileMode.CLAMP)
